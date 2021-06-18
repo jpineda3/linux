@@ -326,5 +326,15 @@
 		clock-names = "clkin";
 		clock-output-names = "pll0-clk-rf8", "pll0-clk-rfaux8",
 			"pll0-clk-rf16", "pll0-clk-rf32";
+		channel@2 {
+			reg = <2>;
+			adi,output-enable;
+			adi,power-up-frequency = /bits/ 64 <16000000000>;
+		};
+		channel@3 {
+			reg = <3>;
+			adi,output-enable;
+			adi,power-up-frequency = /bits/ 64 <32000000000>;
+		};
 	};
 };
