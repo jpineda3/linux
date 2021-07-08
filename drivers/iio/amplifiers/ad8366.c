@@ -30,6 +30,8 @@
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 
+#define ADRF5720_READ_REG(reg)	(ADRF5720_READ | (reg))
+
 enum ad8366_type {
 	ID_AD8366,
 	ID_ADA4961,
@@ -106,6 +108,17 @@ static struct ad8366_info ad8366_infos[] = {
 		.gain_max = 0,
 	},
 };
+
+static int adrf5720_spi_write_reg(struct spi_device *spi, const u8 reg,
+				  const u8 val)
+{
+	u8 buf[2];
+
+	buf[0] = reg;
+	buf[1] = val;
+
+	return spi_write_then_read(spi, buf, ARRAY_SIZE(buf), NULL, 0);
+}
 
 static int ad8366_write(struct iio_dev *indio_dev,
 			unsigned char ch_a, unsigned char ch_b)
@@ -268,22 +281,50 @@ static int ad8366_write_raw(struct iio_dev *indio_dev,
 	return ret;
 }
 
-static int ad8366_write_raw_get_fmt(struct iio_dev *indio_dev,
-				    struct iio_chan_spec const *chan,
-				    long mask)
+static int adrf5720_reg_access_rw(struct spi_device *spi, unsigned int reg,
+				  unsigned int *readval)
 {
-	switch (mask) {
-	case IIO_CHAN_INFO_HARDWAREGAIN:
-		return IIO_VAL_INT_PLUS_MICRO_DB;
-	default:
-		return -EINVAL;
-	}
+	int ret;
+
+	ret = spi_w8r8(spi, ADRF5720_READ_REG(reg));
+	if (ret < 0)
+		return ret;
+
+	*readval = ret;
+
+	return 0;
+}
+
+static int adrf5720_reg_access(struct iio_dev *indio_dev, unsigned int reg,
+			       unsigned int writeval, unsigned int *readval)
+{
+	struct adrf5720_state *st = iio_priv(indio_dev);
+
+	if (readval)
+		return adrf5720_reg_access_rw(st->spi, reg, readval);
+	else
+		return adrf5720_spi_write_reg(st->spi, reg, writeval);
+}
+
+static int adrf5720_reg_access_rw(struct spi_device *spi, unsigned int reg,
+				  unsigned int *readval)
+{
+	int ret;
+
+	ret = spi_w8r8(spi, ADXRS290_READ_REG(reg));
+	if (ret < 0)
+		return ret;
+
+	*readval = ret;
+
+	return 0;
 }
 
 static const struct iio_info ad8366_info = {
 	.read_raw = &ad8366_read_raw,
 	.write_raw = &ad8366_write_raw,
 	.write_raw_get_fmt = &ad8366_write_raw_get_fmt,
+	.debugfs_reg_access = &adrf5720_reg_access,
 };
 
 #define AD8366_CHAN(_channel) {				\
