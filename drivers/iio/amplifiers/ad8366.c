@@ -33,7 +33,7 @@
 #include <linux/bitfield.h>
 
 
-#define ADXRS290_READ		BIT(7)
+#define ADRF5720_READ		BIT(7)
 #define ADRF5720_READ_REG(reg)	(ADRF5720_READ | (reg))
 
 enum ad8366_type {
@@ -308,20 +308,6 @@ static int adrf5720_reg_access(struct iio_dev *indio_dev, unsigned int reg,
 		return adrf5720_reg_access_rw(st->spi, reg, readval);
 	else
 		return adrf5720_spi_write_reg(st->spi, reg, writeval);
-}
-
-static int adrf5720_reg_access_rw(struct spi_device *spi, unsigned int reg,
-				  unsigned int *readval)
-{
-	int ret;
-
-	ret = spi_w8r8(spi, ADRF5720_READ_REG(reg));
-	if (ret < 0)
-		return ret;
-
-	*readval = ret;
-
-	return 0;
 }
 
 static const struct iio_info ad8366_info = {
