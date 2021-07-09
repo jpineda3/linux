@@ -310,6 +310,18 @@ static int adrf5720_reg_access(struct iio_dev *indio_dev, unsigned int reg,
 		return adrf5720_spi_write_reg(st->spi, reg, writeval);
 }
 
+static int ad8366_write_raw_get_fmt(struct iio_dev *indio_dev,
+				    struct iio_chan_spec const *chan,
+				    long mask)
+{
+	switch (mask) {
+	case IIO_CHAN_INFO_HARDWAREGAIN:
+		return IIO_VAL_INT_PLUS_MICRO_DB;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct iio_info ad8366_info = {
 	.read_raw = &ad8366_read_raw,
 	.write_raw = &ad8366_write_raw,
