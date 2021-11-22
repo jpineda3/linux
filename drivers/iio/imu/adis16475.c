@@ -353,10 +353,11 @@ static int adis16475_set_freq(struct adis16475 *st, const u32 freq)
 	if (dec > st->info->max_dec)
 		dec = st->info->max_dec;
 
-	ret = adis_write_reg_16(&st->adis, ADIS16475_REG_DEC_RATE, dec);
+	ret = __adis_write_reg_16(&st->adis, ADIS16475_REG_DEC_RATE, dec);
 	if (ret)
 		goto error;
 
+	adis_dev_unlock(&st->adis);
 	/*
 	 * If decimation is used, then gyro and accel data will have meaningful
 	 * bits on the LSB registers. This info is used on the trigger handler.
@@ -606,20 +607,6 @@ static const char * const adis16475_status_error_msgs[] = {
 	[ADIS16475_DIAG_STAT_CLK] = "Clock error",
 };
 
-static int adis16475_enable_irq(struct adis *adis, bool enable)
-{
-	/*
-	 * There is no way to gate the data-ready signal internally inside the
-	 * ADIS16475. We can only control it's polarity...
-	 */
-	if (enable)
-		enable_irq(adis->spi->irq);
-	else
-		disable_irq(adis->spi->irq);
-
-	return 0;
-}
-
 #define ADIS16475_DATA(_prod_id, _timeouts)				\
 {									\
 	.msc_ctrl_reg = ADIS16475_REG_MSG_CTRL,				\
@@ -640,7 +627,7 @@ static int adis16475_enable_irq(struct adis *adis, bool enable)
 		BIT(ADIS16475_DIAG_STAT_SENSOR) |			\
 		BIT(ADIS16475_DIAG_STAT_MEMORY) |			\
 		BIT(ADIS16475_DIAG_STAT_CLK),				\
-	.enable_irq = adis16475_enable_irq,				\
+	.unmasked_drdy = true,						\
 	.timeouts = (_timeouts),					\
 	.burst_reg_cmd = ADIS16475_REG_GLOB_CMD,			\
 	.burst_len = ADIS16475_BURST_MAX_DATA,				\
@@ -1359,7 +1346,14 @@ static int adis16475_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 
-	adis16475_enable_irq(&st->adis, false);
+	/*
+	 * Note that this is not needed in upstream but we still need to have
+	 * it in our tree because the 'IRQF_NO_AUTOEN' flag is still not
+	 * present. With it, the IRQ is automatically disabled when requesting
+	 * it. As soon as we move to a kernel supporting we can drop this call
+	 * and update @adis_validate_irq_flag() accordingly.
+	 */
+	adis_enable_irq(&st->adis, false);
 
 	ret = devm_iio_device_register(&spi->dev, indio_dev);
 	if (ret)

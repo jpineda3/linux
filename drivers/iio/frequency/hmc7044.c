@@ -63,6 +63,8 @@
 #define HMC7044_VCOIN_MODE_EN		BIT(5)
 #define HMC7044_SYNC_PIN_MODE(x)	(((x) & 0x3) << 6)
 
+#define HMC7044_REG_SCRATCHPAD		0x0008
+
 /* PLL1 */
 #define HMC7044_REG_CLKIN0_BUF_CTRL	0x000A
 #define HMC7044_REG_CLKIN1_BUF_CTRL	0x000B
@@ -321,6 +323,7 @@ struct hmc7044 {
 	u32				jdev_desired_sysref_freq;
 	bool				is_sysref_provider;
 	bool				hmc_two_level_tree_sync_en;
+	bool				read_write_confirmed;
 };
 
 static const char * const hmc7044_input_clk_names[] = {
@@ -364,6 +367,54 @@ static int hmc7044_read(struct iio_dev *indio_dev,
 	*val = buf[2];
 
 	return ret;
+}
+
+static int hmc7044_toggle_bit(struct iio_dev *indio_dev,
+			unsigned int reg,
+			unsigned int mask,
+			unsigned int us_delay)
+{
+	struct hmc7044 *hmc = iio_priv(indio_dev);
+	unsigned int val;
+	int ret;
+
+	if (hmc->read_write_confirmed) {
+		ret = hmc7044_read(indio_dev, reg, &val);
+		if (ret < 0)
+			return ret;
+	} else {
+		val = 0;
+	}
+
+	ret = hmc7044_write(indio_dev, reg, val | mask);
+	if (ret < 0)
+		return ret;
+
+	val &= ~mask;
+
+	ret = hmc7044_write(indio_dev, reg, val);
+	if (ret < 0)
+		return ret;
+
+	if (us_delay)
+		usleep_range(us_delay, us_delay * 2);
+
+	return 0;
+}
+
+static void hmc7044_read_write_check(struct iio_dev *indio_dev)
+{
+	struct hmc7044 *hmc = iio_priv(indio_dev);
+	unsigned int val;
+
+	hmc7044_write(indio_dev, HMC7044_REG_SCRATCHPAD, 0xAD);
+	hmc7044_read(indio_dev, HMC7044_REG_SCRATCHPAD, &val);
+
+	hmc->read_write_confirmed = (val == 0xAD);
+
+	if (!hmc->read_write_confirmed)
+		dev_warn(&hmc->spi->dev,
+			"Read/Write check failed (0x%X)\n", val);
 }
 
 static unsigned int hmc7044_calc_out_div(unsigned long parent_rate,
@@ -521,17 +572,24 @@ static ssize_t hmc7044_show(struct device *dev,
 
 static int hmc7044_sync_pin_set(struct iio_dev *indio_dev, unsigned mode)
 {
+	struct hmc7044 *hmc = iio_priv(indio_dev);
 	u32 val;
 	int ret;
 
-	ret = hmc7044_read(indio_dev, HMC7044_REG_GLOB_MODE, &val);
-	if (ret < 0)
-		return ret;
+	if (hmc->read_write_confirmed) {
+		ret = hmc7044_read(indio_dev, HMC7044_REG_GLOB_MODE, &val);
+		if (ret < 0)
+			return ret;
+	} else {
+		val = (hmc->clkin0_rfsync_en ? HMC7044_RFSYNC_EN : 0) |
+		      (hmc->clkin1_vcoin_en ? HMC7044_VCOIN_MODE_EN : 0) |
+		      HMC7044_REF_PATH_EN(0xF);
+	}
 
 	val &= ~HMC7044_SYNC_PIN_MODE(~0);
 	val |= HMC7044_SYNC_PIN_MODE(mode);
 
-	return  hmc7044_write(indio_dev, HMC7044_REG_GLOB_MODE, val);
+	return hmc7044_write(indio_dev, HMC7044_REG_GLOB_MODE, val);
 }
 
 static ssize_t hmc7044_sync_pin_mode_store(struct device *dev,
@@ -769,6 +827,65 @@ static int hmc7044_clk_register(struct iio_dev *indio_dev,
 	return 0;
 }
 
+static int hmc7044_info(struct iio_dev *indio_dev)
+{
+	struct hmc7044 *hmc = iio_priv(indio_dev);
+	u32 alarm_stat = 0, pll1_stat = 0, clkin_freq, active;
+	int ret;
+
+	if (!hmc->read_write_confirmed) {
+		dev_info(&hmc->spi->dev,
+			"Probed, SPI read support failed\n");
+		return 0;
+	}
+
+	if (hmc->device_id == HMC7044 && !hmc->clkin1_vcoin_en) {
+		ret = hmc7044_read(indio_dev,
+			HMC7044_REG_PLL1_STATUS, &pll1_stat);
+		if (ret < 0)
+			return ret;
+
+		if (HMC7044_PLL1_FSM_STATE(pll1_stat) != 2) { /* Lock */
+			msleep(DIV_ROUND_UP(5000, hmc->pll1_loop_bw));
+			ret = hmc7044_read(indio_dev,
+				HMC7044_REG_PLL1_STATUS, &pll1_stat);
+			if (ret < 0)
+				return ret;
+		}
+
+		ret = hmc7044_read(indio_dev,
+			HMC7044_REG_ALARM_READBACK, &alarm_stat);
+		if (ret < 0)
+			return ret;
+
+		active = HMC7044_PLL1_ACTIVE_CLKIN(pll1_stat);
+	} else {
+		active = 1;
+	}
+
+	if (hmc->device_id == HMC7043)
+		active = 0;
+
+	if (hmc->clkin_freq_ccf[active])
+		clkin_freq = hmc->clkin_freq_ccf[active];
+	else
+		clkin_freq = hmc->clkin_freq[active];
+
+	if (hmc->device_id == HMC7044 && !hmc->clkin1_vcoin_en)
+		dev_info(&hmc->spi->dev,
+			"PLL1: %s, CLKIN%u @ %u Hz, PFD: %u kHz - PLL2: %s @ %u.%06u MHz\n",
+			pll1_fsm_states[HMC7044_PLL1_FSM_STATE(pll1_stat)],
+			active, clkin_freq, hmc->pll1_pfd,
+			HMC7044_PLL2_LOCK_DETECT(alarm_stat) ?
+			"Locked" : "Unlocked", hmc->pll2_freq / 1000000,
+			hmc->pll2_freq % 1000000);
+	else
+		dev_info(&hmc->spi->dev, "CLKIN%u @ %u.%06u MHz\n", active,
+			clkin_freq / 1000000, clkin_freq % 1000000);
+
+	return 0;
+}
+
 static int hmc7044_setup(struct iio_dev *indio_dev)
 {
 	struct hmc7044 *hmc = iio_priv(indio_dev);
@@ -880,28 +997,45 @@ static int hmc7044_setup(struct iio_dev *indio_dev)
 		return -EINVAL;
 
 	/* Resets all registers to default values */
-	hmc7044_write(indio_dev, HMC7044_REG_SOFT_RESET, HMC7044_SOFT_RESET);
-	mdelay(10);
-	hmc7044_write(indio_dev, HMC7044_REG_SOFT_RESET, 0);
-	mdelay(10);
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_SOFT_RESET,
+		HMC7044_SOFT_RESET, 100);
+	if (ret)
+		return ret;
+
+	hmc7044_read_write_check(indio_dev);
 
 	/* Disable all channels */
-	for (i = 0; i < HMC7044_NUM_CHAN; i++)
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(i), 0);
+	for (i = 0; i < HMC7044_NUM_CHAN; i++) {
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(i), 0);
+		if (ret)
+			return ret;
+	}
 
 	/* Load the configuration updates (provided by Analog Devices) */
-	hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_LOW_PW, 0x4d);
-	hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_HIGH_PW, 0xdf);
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_DELAY, 0x06);
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_HOLDOVER, 0x06);
-	hmc7044_write(indio_dev, HMC7044_REG_VTUNE_PRESET, 0x04);
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_LOW_PW, 0x4d);
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_HIGH_PW, 0xdf);
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_DELAY, 0x06);
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_HOLDOVER, 0x06);
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_VTUNE_PRESET, 0x04);
+	if (ret)
+		return ret;
 
 
-	hmc7044_write(indio_dev, HMC7044_REG_GLOB_MODE,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_GLOB_MODE,
 		      HMC7044_SYNC_PIN_MODE(hmc->sync_pin_mode) |
 		      (hmc->clkin0_rfsync_en ? HMC7044_RFSYNC_EN : 0) |
 		      (hmc->clkin1_vcoin_en ? HMC7044_VCOIN_MODE_EN : 0) |
 		      HMC7044_REF_PATH_EN(ref_en));
+	if (ret)
+		return ret;
 
 	/* Program PLL2 */
 
@@ -911,115 +1045,166 @@ static int hmc7044_setup(struct iio_dev *indio_dev)
 		hmc->pll2_freq = hmc->clkin_freq_ccf[1] ?
 			hmc->clkin_freq_ccf[1] : hmc->clkin_freq[1];
 
-		if (hmc->pll2_freq < 1000000000U)
-			hmc7044_write(indio_dev, HMC7044_CLK_INPUT_CTRL,
+		if (hmc->pll2_freq < 1000000000U) {
+			ret = hmc7044_write(indio_dev, HMC7044_CLK_INPUT_CTRL,
 				      HMC7044_LOW_FREQ_INPUT_MODE);
+			if (ret)
+				return ret;
+		}
 
-		hmc7044_write(indio_dev, HMC7044_REG_EN_CTRL_0,
+		ret = hmc7044_write(indio_dev, HMC7044_REG_EN_CTRL_0,
 			      (hmc->rf_reseeder_en ? HMC7044_RF_RESEEDER_EN : 0) |
 			      HMC7044_VCO_SEL(0) |
 			      HMC7044_SYSREF_TIMER_EN);
+		if (ret)
+			return ret;
 
-		hmc7044_write(indio_dev, HMC7044_REG_SYNC, HMC7044_SYNC_RETIME);
+		ret = hmc7044_write(indio_dev, HMC7044_REG_SYNC, HMC7044_SYNC_RETIME);
+		if (ret)
+			return ret;
 	} else {
-		hmc7044_write(indio_dev, HMC7044_REG_EN_CTRL_0,
+		ret = hmc7044_write(indio_dev, HMC7044_REG_EN_CTRL_0,
 			      (hmc->rf_reseeder_en ? HMC7044_RF_RESEEDER_EN : 0) |
 				HMC7044_VCO_SEL(high_vco_en ?
 				HMC7044_VCO_HIGH :
 				HMC7044_VCO_LOW) |
 				HMC7044_SYSREF_TIMER_EN | HMC7044_PLL2_EN |
 				HMC7044_PLL1_EN);
+		if (ret)
+			return ret;
 	}
 
-	if (hmc->pll2_cap_bank_sel != ~0)
-		hmc7044_write(indio_dev, HMC7044_REG_FORCE_CAPVAL,
+	if (hmc->pll2_cap_bank_sel != ~0) {
+		ret = hmc7044_write(indio_dev, HMC7044_REG_FORCE_CAPVAL,
 			HMC7044_FORCE_CAP_VALUE(hmc->pll2_cap_bank_sel) |
 			HMC7044_FORCE_CAPS_FROM_SPI_EN);
+		if (ret)
+			return ret;
+	}
 
 	/* Program the dividers */
-	hmc7044_write(indio_dev, HMC7044_REG_PLL2_R_LSB,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL2_R_LSB,
 		      HMC7044_R2_LSB(r2[0]));
-	hmc7044_write(indio_dev, HMC7044_REG_PLL2_R_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL2_R_MSB,
 		      HMC7044_R2_MSB(r2[0]));
-	hmc7044_write(indio_dev, HMC7044_REG_PLL2_N_LSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL2_N_LSB,
 		      HMC7044_N2_LSB(n2[0]));
-	hmc7044_write(indio_dev, HMC7044_REG_PLL2_N_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL2_N_MSB,
 		      HMC7044_N2_MSB(n2[0]));
+	if (ret)
+		return ret;
 
 	/* Program the reference doubler */
-	hmc7044_write(indio_dev, HMC7044_REG_PLL2_FREQ_DOUBLER,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL2_FREQ_DOUBLER,
 		      pll2_freq_doubler_en ? 0 : HMC7044_PLL2_FREQ_DOUBLER_DIS);
-
+	if (ret)
+		return ret;
 	/* Program PLL1 */
 
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_CP_CTRL,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_CP_CTRL,
 		HMC7044_PLL1_CP_CURRENT(hmc->pll1_cp_current /
 			HMC7044_CP_CURRENT_STEP - 1));
-
+	if (ret)
+		return ret;
 	/* Set the lock detect timer threshold */
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_LOCK_DETECT,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_LOCK_DETECT,
 		      HMC7044_LOCK_DETECT_TIMER(pll1_lock_detect));
 
 	/* Set the LCM */
 	for (i = 0; i < ARRAY_SIZE(clkin_freq); i++) {
-		hmc7044_write(indio_dev, HMC7044_REG_CLKIN_PRESCALER(i),
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN_PRESCALER(i),
 			      in_prescaler[i]);
+		if (ret)
+			return ret;
 	}
-	hmc7044_write(indio_dev, HMC7044_REG_OSCIN_PRESCALER,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_OSCIN_PRESCALER,
 		      in_prescaler[4]);
-
+	if (ret)
+		return ret;
 	/* Program the dividers */
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_R_LSB,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_R_LSB,
 		      HMC7044_R2_LSB(r1));
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_R_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_R_MSB,
 		      HMC7044_R2_MSB(r1));
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_N_LSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_N_LSB,
 		      HMC7044_N2_LSB(n1));
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_N_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_N_MSB,
 		      HMC7044_N2_MSB(n1));
-
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_REF_PRIO_CTRL,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_REF_PRIO_CTRL,
 		      hmc->pll1_ref_prio_ctrl);
-
-	hmc7044_write(indio_dev, HMC7044_REG_PLL1_REF_SWITCH,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PLL1_REF_SWITCH,
 		      HMC7044_HOLDOVER_DAC |
 		      (hmc->pll1_ref_autorevert_en ?
 		      HMC7044_AUTO_REVERT_SWITCH : 0) |
 		      HMC7044_AUTO_MODE_SWITCH);
-
+	if (ret)
+		return ret;
 	/* Program the SYSREF timer */
 
 	/* Set the divide ratio */
-	hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_LSB,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_LSB,
 		      HMC7044_SYSREF_TIMER_LSB(hmc->sysref_timer_div));
-	hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_MSB,
 		      HMC7044_SYSREF_TIMER_MSB(hmc->sysref_timer_div));
-
+	if (ret)
+		return ret;
 	/* Set the pulse generator mode configuration */
-	hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
 		      HMC7044_PULSE_GEN_MODE(hmc->pulse_gen_mode));
-
+	if (ret)
+		return ret;
 	/* Enable the input buffers */
-	hmc7044_write(indio_dev, HMC7044_REG_CLKIN0_BUF_CTRL,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN0_BUF_CTRL,
 		      hmc->in_buf_mode[0]);
-	hmc7044_write(indio_dev, HMC7044_REG_CLKIN1_BUF_CTRL,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN1_BUF_CTRL,
 		      hmc->in_buf_mode[1]);
-	hmc7044_write(indio_dev, HMC7044_REG_CLKIN2_BUF_CTRL,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN2_BUF_CTRL,
 		      hmc->in_buf_mode[2]);
-	hmc7044_write(indio_dev, HMC7044_REG_CLKIN3_BUF_CTRL,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN3_BUF_CTRL,
 		      hmc->in_buf_mode[3]);
-	hmc7044_write(indio_dev, HMC7044_REG_OSCIN_BUF_CTRL,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_OSCIN_BUF_CTRL,
 		      hmc->in_buf_mode[4]);
-
+	if (ret)
+		return ret;
 	/* Set GPIOs */
 	for (i = 0; i < ARRAY_SIZE(hmc->gpi_ctrl); i++) {
-		hmc7044_write(indio_dev, HMC7044_REG_GPI_CTRL(i),
+		ret = hmc7044_write(indio_dev, HMC7044_REG_GPI_CTRL(i),
 			      hmc->gpi_ctrl[i]);
+		if (ret)
+			return ret;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(hmc->gpo_ctrl); i++) {
-		hmc7044_write(indio_dev, HMC7044_REG_GPO_CTRL(i),
+		ret = hmc7044_write(indio_dev, HMC7044_REG_GPO_CTRL(i),
 			      hmc->gpo_ctrl[i]);
+		if (ret)
+			return ret;
 	}
 
 	mdelay(10);
@@ -1031,33 +1216,44 @@ static int hmc7044_setup(struct iio_dev *indio_dev)
 		if (chan->num >= HMC7044_NUM_CHAN || chan->disable)
 			continue;
 
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_1(chan->num),
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_1(chan->num),
 			      HMC7044_DIV_LSB(chan->divider));
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_2(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_2(chan->num),
 			      HMC7044_DIV_MSB(chan->divider));
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_8(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_8(chan->num),
 			      HMC7044_DRIVER_MODE(chan->driver_mode) |
 			      HMC7044_DRIVER_Z_MODE(chan->driver_impedance) |
 			      (chan->dynamic_driver_enable ?
 			      HMC7044_DYN_DRIVER_EN : 0) |
 			      (chan->force_mute_enable ?
 			      HMC7044_FORCE_MUTE_EN : 0));
-
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_3(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_3(chan->num),
 			      chan->fine_delay & 0x1F);
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_4(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_4(chan->num),
 			      chan->coarse_delay & 0x1F);
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_7(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_7(chan->num),
 			      chan->out_mux_mode & 0x3);
-
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(chan->num),
 			      (chan->start_up_mode_dynamic_enable ?
 			      HMC7044_START_UP_MODE_DYN_EN : 0) |
 			      (chan->output_control0_rb4_enable ? BIT(4) : 0) |
 			      (chan->high_performance_mode_dis ?
 			      0 : HMC7044_HI_PERF_MODE) | HMC7044_SYNC_EN |
 			      HMC7044_CH_EN);
-
+		if (ret)
+			return ret;
 		hmc->iio_channels[i].type = IIO_ALTVOLTAGE;
 		hmc->iio_channels[i].output = 1;
 		hmc->iio_channels[i].indexed = 1;
@@ -1071,13 +1267,21 @@ static int hmc7044_setup(struct iio_dev *indio_dev)
 	mdelay(10);
 
 	/* Do a restart to reset the system and initiate calibration */
-	hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
-		      HMC7044_RESTART_DIV_FSM);
-	mdelay(1);
-	hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+		HMC7044_RESTART_DIV_FSM, 10000);
+	if (ret)
+		return ret;
+
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+		HMC7044_RESEED_REQ, 1000);
+	if (ret)
+		return ret;
+
+	ret = hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
 		      (hmc->high_performance_mode_clock_dist_en ?
 		      HMC7044_HIGH_PERF_DISTRIB_PATH : 0));
-	mdelay(1);
+	if (ret)
+		return ret;
 
 	if (!hmc->clkin1_vcoin_en) {
 		u32 pll1_stat;
@@ -1106,6 +1310,10 @@ static int hmc7044_setup(struct iio_dev *indio_dev)
 	hmc->clk_data.clks = hmc->clks;
 	hmc->clk_data.clk_num = HMC7044_NUM_CHAN;
 
+	ret = hmc7044_info(indio_dev);
+	if (ret)
+		return ret;
+
 	return of_clk_add_provider(hmc->spi->dev.of_node,
 				   of_clk_src_onecell_get,
 				   &hmc->clk_data);
@@ -1129,51 +1337,79 @@ static int hmc7043_setup(struct iio_dev *indio_dev)
 	}
 
 	/* Resets all registers to default values */
-	hmc7044_write(indio_dev, HMC7044_REG_SOFT_RESET, HMC7044_SOFT_RESET);
-	mdelay(10);
-	hmc7044_write(indio_dev, HMC7044_REG_SOFT_RESET, 0);
-	mdelay(10);
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_SOFT_RESET,
+		HMC7044_SOFT_RESET, 100);
+	if (ret)
+		return ret;
+
+	hmc7044_read_write_check(indio_dev);
 
 	/* Load the configuration updates (provided by Analog Devices) */
-	hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_LOW_PW, 0x4d);
-	hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_HIGH_PW, 0xdf);
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_LOW_PW, 0x4d);
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLK_OUT_DRV_HIGH_PW, 0xdf);
+	if (ret)
+		return ret;
 
 	/* Disable all channels */
-	for (i = 0; i < HMC7044_NUM_CHAN; i++)
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(i), 0);
+	for (i = 0; i < HMC7044_NUM_CHAN; i++) {
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(i), 0);
+		if (ret)
+			return ret;
+	}
 
-	if (hmc->pll2_freq < 1000000000U)
-		hmc7044_write(indio_dev, HMC7044_CLK_INPUT_CTRL,
+	if (hmc->pll2_freq < 1000000000U) {
+		ret = hmc7044_write(indio_dev, HMC7044_CLK_INPUT_CTRL,
 			      HMC7044_LOW_FREQ_INPUT_MODE);
+		if (ret)
+			return ret;
+	}
 
-	hmc7044_write(indio_dev, HMC7044_REG_EN_CTRL_0,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_EN_CTRL_0,
 		(hmc->rf_reseeder_en ? HMC7044_RF_RESEEDER_EN : 0) |
 		HMC7044_SYSREF_TIMER_EN);
+	if (ret)
+		return ret;
 
 	/* Program the SYSREF timer */
 
 	/* Set the divide ratio */
-	hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_LSB,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_LSB,
 		HMC7044_SYSREF_TIMER_LSB(hmc->sysref_timer_div));
-	hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_MSB,
 		HMC7044_SYSREF_TIMER_MSB(hmc->sysref_timer_div));
+	if (ret)
+		return ret;
 
 	/* Set the pulse generator mode configuration */
-	hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
 		HMC7044_PULSE_GEN_MODE(hmc->pulse_gen_mode));
+	if (ret)
+		return ret;
 
 	/* Enable the input buffers */
-	hmc7044_write(indio_dev, HMC7044_REG_CLKIN0_BUF_CTRL,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN0_BUF_CTRL,
 		hmc->in_buf_mode[0]);
-	hmc7044_write(indio_dev, HMC7044_REG_CLKIN1_BUF_CTRL,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_CLKIN1_BUF_CTRL,
 		hmc->in_buf_mode[1]);
+	if (ret)
+		return ret;
 
 	/* Set GPIOs */
-	hmc7044_write(indio_dev, HMC7044_REG_GPI_CTRL(0),
+	ret = hmc7044_write(indio_dev, HMC7044_REG_GPI_CTRL(0),
 		hmc->gpi_ctrl[0]);
+	if (ret)
+		return ret;
 
-	hmc7044_write(indio_dev, HMC7044_REG_GPO_CTRL(0),
+	ret = hmc7044_write(indio_dev, HMC7044_REG_GPO_CTRL(0),
 		hmc->gpo_ctrl[0]);
+	if (ret)
+		return ret;
 
 	/* Program the output channels */
 	for (i = 0; i < hmc->num_channels; i++) {
@@ -1182,32 +1418,45 @@ static int hmc7043_setup(struct iio_dev *indio_dev)
 		if (chan->num >= HMC7044_NUM_CHAN || chan->disable)
 			continue;
 
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_1(chan->num),
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_1(chan->num),
 			HMC7044_DIV_LSB(chan->divider));
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_2(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_2(chan->num),
 			HMC7044_DIV_MSB(chan->divider));
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_8(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_8(chan->num),
 			HMC7044_DRIVER_MODE(chan->driver_mode) |
 			HMC7044_DRIVER_Z_MODE(chan->driver_impedance) |
 			(chan->dynamic_driver_enable ?
 			HMC7044_DYN_DRIVER_EN : 0) |
 			(chan->force_mute_enable ?
 			HMC7044_FORCE_MUTE_EN : 0));
-
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_3(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_3(chan->num),
 			chan->fine_delay & 0x1F);
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_4(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_4(chan->num),
 			chan->coarse_delay & 0x1F);
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_7(chan->num),
+		if (ret)
+			return ret;
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_7(chan->num),
 			chan->out_mux_mode & 0x3);
+		if (ret)
+			return ret;
 
-		hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(chan->num),
+		ret = hmc7044_write(indio_dev, HMC7044_REG_CH_OUT_CRTL_0(chan->num),
 			(chan->start_up_mode_dynamic_enable ?
 			HMC7044_START_UP_MODE_DYN_EN : 0) |
 			(chan->output_control0_rb4_enable ? BIT(4) : 0) |
 			(chan->high_performance_mode_dis ?
 			0 : HMC7044_HI_PERF_MODE) | HMC7044_SYNC_EN |
 			HMC7044_CH_EN);
+		if (ret)
+			return ret;
 
 		hmc->iio_channels[i].type = IIO_ALTVOLTAGE;
 		hmc->iio_channels[i].output = 1;
@@ -1222,13 +1471,21 @@ static int hmc7043_setup(struct iio_dev *indio_dev)
 	mdelay(10);
 
 	/* Do a restart to reset the system and initiate calibration */
-	hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
-		HMC7044_RESTART_DIV_FSM);
-	mdelay(1);
-	hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+		HMC7044_RESTART_DIV_FSM, 1000);
+	if (ret)
+		return ret;
+
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+		HMC7044_RESEED_REQ, 1000);
+	if (ret)
+		return ret;
+
+	ret = hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
 		(hmc->high_performance_mode_clock_dist_en ?
 		HMC7044_HIGH_PERF_DISTRIB_PATH : 0));
-	mdelay(1);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < hmc->num_channels; i++) {
 		chan = &hmc->channels[i];
@@ -1244,6 +1501,10 @@ static int hmc7043_setup(struct iio_dev *indio_dev)
 
 	hmc->clk_data.clks = hmc->clks;
 	hmc->clk_data.clk_num = HMC7044_NUM_CHAN;
+
+	ret = hmc7044_info(indio_dev);
+	if (ret)
+		return ret;
 
 	return of_clk_add_provider(hmc->spi->dev.of_node,
 				of_clk_src_onecell_get,
@@ -1500,6 +1761,9 @@ static int hmc7044_status_show(struct seq_file *file, void *offset)
 	int ret;
 	u32 alarm_stat, pll1_stat, pll2_autotune_val, clkin_freq, active;
 
+	if (!hmc->read_write_confirmed)
+		return -EIO;
+
 	ret = hmc7044_read(indio_dev, HMC7044_REG_PLL1_STATUS, &pll1_stat);
 	if (ret < 0)
 		return ret;
@@ -1659,23 +1923,12 @@ static int hmc7044_jesd204_sysref(struct jesd204_dev *jdev)
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct hmc7044 *hmc = iio_priv(indio_dev);
 	int ret;
-	u32 val;
 
 	dev_dbg(dev, "%s:%d\n", __func__, __LINE__);
 
 	mutex_lock(&hmc->lock);
-
-	ret = hmc7044_read(indio_dev, HMC7044_REG_REQ_MODE_0, &val);
-	if (ret < 0) {
-		mutex_unlock(&hmc->lock);
-		return ret;
-	}
-
-	hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
-		val | HMC7044_PULSE_GEN_REQ);
-
-	ret = hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0, val);
-
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+				 HMC7044_PULSE_GEN_REQ, 0);
 	mutex_unlock(&hmc->lock);
 
 	return ret;
@@ -1687,44 +1940,59 @@ static int hmc7044_jesd204_clks_sync1(struct jesd204_dev *jdev,
 	struct device *dev = jesd204_dev_to_device(jdev);
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct hmc7044 *hmc = iio_priv(indio_dev);
+	bool cont_mode = false;
 	int ret;
-	unsigned mask, val;
-
-	if (!hmc->hmc_two_level_tree_sync_en)
-		return JESD204_STATE_CHANGE_DONE;
 
 	if (reason != JESD204_STATE_OP_REASON_INIT)
 		return JESD204_STATE_CHANGE_DONE;
 
+	if (!hmc->hmc_two_level_tree_sync_en)
+		goto reseed;
+
 	dev_dbg(dev, "%s:%d reason %s\n", __func__, __LINE__, jesd204_state_op_reason_str(reason));
 
 	if (hmc->is_sysref_provider) {
-		if (hmc->device_id == HMC7044)
-			hmc7044_sync_pin_set(indio_dev, HMC7044_SYNC_PIN_DISABLED);
-
-		mask = HMC7044_RESTART_DIV_FSM;
+		if (hmc->device_id == HMC7044) {
+			ret = hmc7044_sync_pin_set(indio_dev, HMC7044_SYNC_PIN_DISABLED);
+			if (ret)
+				return ret;
+		}
 	} else {
-		if (hmc->device_id == HMC7044 && !hmc->clkin0_rfsync_en && !hmc->clkin1_vcoin_en)
-			hmc7044_sync_pin_set(indio_dev, HMC7044_SYNC_PIN_SYNC);
-		else
-			hmc7044_continuous_chan_sync_enable(indio_dev, 1);
-
-
-		mask = HMC7044_RESTART_DIV_FSM | HMC7044_RESEED_REQ;
+		if (hmc->device_id == HMC7044 && !hmc->clkin0_rfsync_en && !hmc->clkin1_vcoin_en) {
+			ret = hmc7044_sync_pin_set(indio_dev, HMC7044_SYNC_PIN_SYNC);
+			if (ret)
+				return ret;
+		} else {
+			ret = hmc7044_continuous_chan_sync_enable(indio_dev, 1);
+			if (ret)
+				return ret;
+		}
 	}
 
-	ret = hmc7044_read(indio_dev, HMC7044_REG_REQ_MODE_0, &val);
-	if (ret < 0)
-		return ret;
-
-	hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0,
-		val | mask);
-
-	ret = hmc7044_write(indio_dev, HMC7044_REG_REQ_MODE_0, val);
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+		HMC7044_RESTART_DIV_FSM, (hmc->device_id == HMC7044 &&
+		!hmc->clkin1_vcoin_en) ? 10000 : 1000);
 	if (ret)
 		return ret;
 
-	msleep(1);
+reseed:
+	if (hmc->pulse_gen_mode == HMC7044_PULSE_GEN_CONT_PULSE) {
+		cont_mode = true;
+
+		hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
+			      HMC7044_PULSE_GEN_MODE(HMC7044_PULSE_GEN_LEVEL_SENSITIVE));
+		mdelay(10);
+	}
+
+	ret = hmc7044_toggle_bit(indio_dev, HMC7044_REG_REQ_MODE_0,
+		HMC7044_RESEED_REQ, 1000);
+	if (ret)
+		return ret;
+
+	if (cont_mode)
+		hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
+		      HMC7044_PULSE_GEN_MODE(HMC7044_PULSE_GEN_CONT_PULSE));
+
 
 	return JESD204_STATE_CHANGE_DONE;
 }
@@ -1775,20 +2043,28 @@ static int hmc7044_jesd204_clks_sync3(struct jesd204_dev *jdev,
 	if (hmc->is_sysref_provider)
 		return JESD204_STATE_CHANGE_DONE;
 
-	ret = hmc7044_read(indio_dev, HMC7044_REG_ALARM_READBACK, &val);
-	if (ret < 0)
-		return ret;
+	if (hmc->read_write_confirmed) {
+		int ret;
 
-	if (!HMC7044_CLK_OUT_PH_STATUS(val))
-		dev_err(dev,
-			"%s: SYSREF of the HMC7044 is not valid; that is, its phase output is not stable (0x%X)\n",
-			__func__, val & 0xFF);
+		ret = hmc7044_read(indio_dev, HMC7044_REG_ALARM_READBACK, &val);
+		if (ret < 0)
+			return ret;
 
-	if (hmc->device_id == HMC7044 && !hmc->clkin0_rfsync_en && !hmc->clkin1_vcoin_en)
-		hmc7044_sync_pin_set(indio_dev, HMC7044_SYNC_PIN_PULSE_GEN_REQ);
-	else
-		hmc7044_continuous_chan_sync_enable(indio_dev, 0);
+		if (!HMC7044_CLK_OUT_PH_STATUS(val))
+			dev_warn(dev,
+				"%s: SYSREF of the HMC7044 is not valid; that is, its phase output is not stable (0x%X)\n",
+				__func__, val & 0xFF);
+	}
 
+	if (hmc->device_id == HMC7044 && !hmc->clkin0_rfsync_en && !hmc->clkin1_vcoin_en) {
+		ret = hmc7044_sync_pin_set(indio_dev, HMC7044_SYNC_PIN_PULSE_GEN_REQ);
+		if (ret)
+			return ret;
+	} else {
+		ret = hmc7044_continuous_chan_sync_enable(indio_dev, 0);
+		if (ret)
+			return ret;
+	}
 
 	return JESD204_STATE_CHANGE_DONE;
 }
@@ -1852,10 +2128,14 @@ static int hmc7044_jesd204_link_pre_setup(struct jesd204_dev *jdev,
 	sysref_timer = hmc->pll2_freq / sysref_timer;
 
 	/* Set the divide ratio */
-	hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_LSB,
+	ret = hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_LSB,
 		      HMC7044_SYSREF_TIMER_LSB(sysref_timer));
-	hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_MSB,
+	if (ret)
+		return ret;
+	ret = hmc7044_write(indio_dev, HMC7044_REG_SYSREF_TIMER_MSB,
 		      HMC7044_SYSREF_TIMER_MSB(sysref_timer));
+	if (ret)
+		return ret;
 
 	if (lnk->sysref.mode == JESD204_SYSREF_CONTINUOUS) {
 		/* Set the pulse generator mode configuration */
@@ -1863,10 +2143,13 @@ static int hmc7044_jesd204_link_pre_setup(struct jesd204_dev *jdev,
 			dev_warn(dev, "%s: Link%u forcing continuous SYSREF mode\n",
 				__func__, lnk->link_id);
 
-		hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
-			HMC7044_PULSE_GEN_MODE(HMC7044_PULSE_GEN_CONT_PULSE));
-	}
+		hmc->pulse_gen_mode = HMC7044_PULSE_GEN_CONT_PULSE;
 
+		ret = hmc7044_write(indio_dev, HMC7044_REG_PULSE_GEN,
+			HMC7044_PULSE_GEN_MODE(HMC7044_PULSE_GEN_CONT_PULSE));
+		if (ret)
+			return ret;
+	}
 
 	return JESD204_STATE_CHANGE_DONE;
 }

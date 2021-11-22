@@ -45,7 +45,6 @@
 			#size-cells = <0>;
 
 			adis16480: adis16480@0 {
-				compatible = "adi,adis16495-3";
 				reg = <0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&adis16480_pins>;
@@ -61,9 +60,15 @@
 	};
 
 	__overrides__ {
-		interrupt = <&adis16480_pins>,"brcm,pins:0",
-				<&adis16480>,"interrupts:0";
-		reset = <&adis16480_pins>,"brcm,pins:4",
-				<&adis16480>,"reset-gpios:4";
+		device = <&adis16480>,"compatible";
+		drdy_dio2 = <&adis16480_pins>,"brcm,pins:0=25",
+				<&adis16480>,"interrupts:0=25",
+				<&adis16480>,"interrupt-names=DIO2";
+		drdy_dio3 = <&adis16480_pins>,"brcm,pins:0=4",
+				<&adis16480>,"interrupts:0=4",
+				<&adis16480>,"interrupt-names=DIO3";
+		drdy_dio4 = <&adis16480_pins>,"brcm,pins:0=5",
+				<&adis16480>,"interrupts:0=5",
+				<&adis16480>,"interrupt-names=DIO4";
 	};
 };
